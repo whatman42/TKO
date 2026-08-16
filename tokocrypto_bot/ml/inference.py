@@ -144,6 +144,12 @@ class MLInferenceEngine:
             self.model = None
             self.model_version = "CORRUPT"
 
+    def is_model_ready(self) -> bool:
+        """True only when a champion artifact is loaded and usable for inference."""
+        return self.model is not None and self.model_version not in (
+            "UNLOADED", "UNAVAILABLE", "CORRUPT", "FEATURE_MISMATCH",
+        )
+
     def _invalid_result(self, feature_frame, status_code, reason):
         return PredictionResult(
             symbol=feature_frame.symbol, timestamp=feature_frame.timestamp,
