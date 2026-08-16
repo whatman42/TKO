@@ -21,12 +21,14 @@ class DecisionThresholds:
 class DecisionEngine:
     def __init__(self, thresholds=None):
         self.thresholds = thresholds or DecisionThresholds()
-    def evaluate(self, symbol, feature_frame, prediction, current_position_qty=0.0, current_price=0.0):
+    def evaluate(self, symbol, feature_frame, prediction, current_position_qty=0.0, current_price=0.0, allow_strategy_fallback=False):
         reasons=[]
-        if not prediction.is_valid:
-            return self._build(symbol, feature_frame.timestamp, DecisionAction.NO_TRADE, 0,0,0,None,None,[f"ML_INVALID_{prediction.status_code}"], prediction.model_version)
         if not feature_frame.is_valid:
-            return self._build(symbol, feature_frame.timestamp, DecisionAction.NO_TRADE, 0,0,0,None,None,["FEATURES_INVALID"], prediction.model_version)
+            return self._build(symbol, feature_frame.timestamp, DecisionAction.NO_TRADE, 0,0,0,None,None,["FEATURES_INVALID"], getattr(prediction, "model_version", "NONE"))
+        if not prediction.is_valid:
+            if allow_strategy_fallback:
+                return self._evaluate_strategy_fallback(symbol, feature_frame, prediction, current_position_qty, current_price)
+            return self._build(symbol, feature_frame.timestamp, DecisionAction.NO_TRADE, 0,0,0,None,None,[f"ML_INVALID_{prediction.status_code}"], prediction.model_version)
         prob_up, prob_down, confidence = prediction.probability_up, prediction.probability_down, prediction.confidence
         feats = feature_frame.features
         rsi, ema_ratio, atr = feats.get("RSI14",50.0), feats.get("ema_ratio",1.0), feats.get("ATR",0.0)
@@ -55,6 +57,29 @@ class DecisionEngine:
         reasons.append("SIGNAL_NEUTRAL")
         action = DecisionAction.HOLD if current_position_qty>0 else DecisionAction.NO_TRADE
         return self._build(symbol, feature_frame.timestamp, action, max(prob_up,prob_down), confidence, 0.0, None, None, reasons, prediction.model_version)
+    def _evaluate_strategy_fallback(self, symbol, feature_frame, prediction, current_position_qty, current_price):
+        """PAPER-only technical path when champion model is unavailable. Never used for LIVE."""
+        reasons = ["STRATEGY_FALLBACK_PAPER", f"ML_INVALID_{prediction.status_code}"]
+        feats = feature_frame.features
+        rsi = feats.get("RSI14", 50.0)
+        ema_ratio = feats.get("ema_ratio", 1.0)
+        atr = feats.get("ATR", 0.0)
+        pband = feats.get("bb_pband", 0.5)
+        vwma_dev = feats.get("vwma_dev", 0.0)
+        if pband < 0.15 and rsi < 35.0 and vwma_dev < -0.01 and ema_ratio >= 0.98:
+            reasons.append("TECH_SCALP_BUY")
+            sl = current_price - 2 * atr if current_price > 0 and atr > 0 else None
+            tp = current_price + 3 * atr if current_price > 0 and atr > 0 else None
+            return self._build(symbol, feature_frame.timestamp, DecisionAction.BUY, 0.55, 0.20, 0.018, sl, tp, reasons, "STRATEGY_FALLBACK")
+        if (pband > 0.85 and rsi > 65.0) or (current_position_qty > 0 and rsi > self.thresholds.rsi_overbought):
+            reasons.append("TECH_SCALP_SELL")
+            sl = current_price + 2 * atr if current_price > 0 and atr > 0 else None
+            tp = current_price - 3 * atr if current_price > 0 and atr > 0 else None
+            return self._build(symbol, feature_frame.timestamp, DecisionAction.SELL, 0.55, 0.20, 0.015, sl, tp, reasons, "STRATEGY_FALLBACK")
+        reasons.append("STRATEGY_FALLBACK_NO_SIGNAL")
+        action = DecisionAction.HOLD if current_position_qty > 0 else DecisionAction.NO_TRADE
+        return self._build(symbol, feature_frame.timestamp, action, 0, 0, 0, None, None, reasons, "STRATEGY_FALLBACK")
+
     def evaluate_multi_pair(self, feature_frames, predictions, current_positions=None, current_prices=None):
         positions, prices = current_positions or {}, current_prices or {}
         return {sym: self.evaluate(sym, ff, predictions.get(sym, PredictionResult(sym,0,"NONE","NONE",0,0,0,False,"MISSING")), positions.get(sym,0), prices.get(sym,0)) for sym, ff in feature_frames.items()}
