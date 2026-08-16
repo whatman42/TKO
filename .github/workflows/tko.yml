@@ -1,0 +1,407 @@
+name: Windows Portable Build
+
+# Manual run dari GitHub Actions UI
+on:
+  workflow_dispatch:
+    inputs:
+      run_smoke:
+        description: "Run PAPER + LIVE smoke tests after build"
+        type: boolean
+        default: true
+
+# Least privilege:
+# Workflow ini hanya membutuhkan akses baca repository dan upload artifact.
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-portable:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+      - name: Checkout
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # ============================================================
+      # 2. PYTHON
+      # ============================================================
+      - name: Setup Python
+        # actions/setup-python@v5.4.0
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+          check-latest: false
+
+      # ============================================================
+      # 3. BUILD AND TEST DEPENDENCIES
+      # ============================================================
+      - name: Install build and test dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python --version
+          python -m pip --version
+
+          python -m pip install --upgrade pip
+
+          # Project runtime dependencies
+          if (Test-Path "requirements.txt") {
+            python -m pip install -r requirements.txt
+          }
+
+          # Dedicated development/test dependencies
+          if (Test-Path "requirements-dev.txt") {
+            python -m pip install -r requirements-dev.txt
+          }
+
+          if (Test-Path "requirements-test.txt") {
+            python -m pip install -r requirements-test.txt
+          }
+
+          # Core build & test tools must always be present
+          python -m pip install pyinstaller pytest
+
+          # Explicit verification of tool availability
+          python -m pytest --version
+          python -m PyInstaller --version
+
+          Write-Host "BUILD_AND_TEST_DEPENDENCIES_OK"
+
+      # ============================================================
+      # 4. SAFETY SCAN
+      # ============================================================
+      - name: Safety scan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $productionFiles = @(
+            "tokocrypto_bot"
+          )
+
+          if (-not (Test-Path "tokocrypto_bot\application.py")) {
+            throw "tokocrypto_bot\application.py missing"
+          }
+
+          # --------------------------------------------------------
+          # force_live_gate MUST NOT EXIST in production source.
+          # --------------------------------------------------------
+          $matches = Get-ChildItem `
+            -Path $productionFiles `
+            -Recurse `
+            -File `
+            -Include *.py,*.toml,*.yaml,*.yml,*.json `
+            -ErrorAction Stop |
+            Select-String -Pattern "force_live_gate"
+
+          if ($matches) {
+            Write-Host "FORCE_LIVE_GATE_OCCURRENCES:"
+            $matches | Format-Table -AutoSize
+            throw "force_live_gate must be ABSENT from production source"
+          }
+
+          # --------------------------------------------------------
+          # Verify required entry points exist.
+          # --------------------------------------------------------
+          if (-not (Test-Path "tko_worker_entry.py")) {
+            throw "tko_worker_entry.py missing"
+          }
+
+          if (-not (Test-Path "tko.spec")) {
+            throw "tko.spec missing"
+          }
+
+          Write-Host "SAFETY_SCAN_OK"
+
+      # ============================================================
+      # 5. STRICT UNIT TESTS (FAIL-CLOSED)
+      # ============================================================
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path "tests")) {
+            throw "tests directory missing: test gate cannot be skipped"
+          }
+
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) {
+            throw "pytest failed with exit code $LASTEXITCODE"
+          }
+
+          Write-Host "TEST_GATE_OK"
+
+      # ============================================================
+      # 6. BUILD PORTABLE
+      # ============================================================
+      - name: Build portable (PyInstaller tko.spec)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not (Test-Path "tko.spec")) {
+            throw "tko.spec missing"
+          }
+
+          if (-not (Test-Path "tko_worker_entry.py")) {
+            throw "tko_worker_entry.py missing"
+          }
+
+          if (Test-Path "build") {
+            Remove-Item "build" -Recurse -Force
+          }
+
+          if (Test-Path "dist") {
+            Remove-Item "dist" -Recurse -Force
+          }
+
+          python -m PyInstaller --noconfirm --clean tko.spec
+
+          if (-not (Test-Path "dist\TKO\TKO.exe")) {
+            throw "TKO.exe missing after build"
+          }
+
+          $exe = Get-Item "dist\TKO\TKO.exe"
+
+          Write-Host "BUILD_OK"
+          Write-Host "Name     : $($exe.Name)"
+          Write-Host "Length   : $($exe.Length)"
+          Write-Host "FullName : $($exe.FullName)"
+
+      # ============================================================
+      # 7. PAPER SMOKE TEST
+      # ============================================================
+      - name: Smoke PAPER (live_unlocked=False)
+        if: ${{ inputs.run_smoke }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $out = "smoke_paper_out.txt"
+          $err = "smoke_paper_err.txt"
+
+          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+
+          $p = Start-Process `
+            -FilePath "dist\TKO\TKO.exe" `
+            -ArgumentList "--mode","PAPER","--poll-interval","2" `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err
+
+          Start-Sleep -Seconds 18
+
+          if (-not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force
+            Start-Sleep -Seconds 2
+          }
+
+          $txt = ""
+
+          if (Test-Path $out) {
+            $txt += Get-Content -Raw $out
+          }
+
+          if (Test-Path $err) {
+            $txt += Get-Content -Raw $err
+          }
+
+          Write-Host "========== PAPER SMOKE OUTPUT =========="
+          Write-Host $txt
+          Write-Host "========================================="
+
+          # --------------------------------------------------------
+          # PAPER must explicitly report live_unlocked=False.
+          # --------------------------------------------------------
+          if ($txt -notmatch "live_unlocked=False") {
+            throw "PAPER smoke failed: expected live_unlocked=False"
+          }
+
+          # --------------------------------------------------------
+          # If the application terminated by itself, it must not
+          # report an unexpected crash.
+          # --------------------------------------------------------
+          if ($p.HasExited -and $p.ExitCode -ne 0) {
+            throw "PAPER smoke crashed with exit code $($p.ExitCode)"
+          }
+
+          Write-Host "PAPER_SMOKE_OK"
+
+      # ============================================================
+      # 8. LIVE FAIL-CLOSED SMOKE TEST
+      # ============================================================
+      - name: Smoke LIVE without credentials (BLOCKED)
+        if: ${{ inputs.run_smoke }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # --------------------------------------------------------
+          # Explicitly remove all known credential environment
+          # variables from this process.
+          # --------------------------------------------------------
+          Remove-Item Env:TOKOCRYPTO_API_KEY -ErrorAction SilentlyContinue
+          Remove-Item Env:TOKOCRYPTO_API_SECRET -ErrorAction SilentlyContinue
+          Remove-Item Env:BINANCE_API_KEY -ErrorAction SilentlyContinue
+          Remove-Item Env:BINANCE_API_SECRET -ErrorAction SilentlyContinue
+
+          $out = "smoke_live_out.txt"
+          $err = "smoke_live_err.txt"
+
+          Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+
+          $p = Start-Process `
+            -FilePath "dist\TKO\TKO.exe" `
+            -ArgumentList "--mode","LIVE" `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -Wait
+
+          $txt = ""
+
+          if (Test-Path $out) {
+            $txt += Get-Content -Raw $out
+          }
+
+          if (Test-Path $err) {
+            $txt += Get-Content -Raw $err
+          }
+
+          Write-Host "========== LIVE SMOKE OUTPUT =========="
+          Write-Host $txt
+          Write-Host "======================================="
+
+          # --------------------------------------------------------
+          # LIVE without credentials MUST be blocked.
+          # --------------------------------------------------------
+          if ($txt -notmatch "LIVE blocked|missing API credentials|HardLiveGate") {
+            throw "LIVE smoke failed: expected fail-closed block"
+          }
+
+          # --------------------------------------------------------
+          # A blocked LIVE execution must not return success.
+          # --------------------------------------------------------
+          if ($p.ExitCode -eq 0) {
+            throw "LIVE smoke failed: expected non-zero exit code"
+          }
+
+          Write-Host "LIVE_EXIT_CODE=$($p.ExitCode)"
+          Write-Host "LIVE_FAIL_CLOSED_OK"
+
+      # ============================================================
+      # 9. ARTIFACT MANIFEST + SHA256
+      # ============================================================
+      - name: Generate build manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $exe = Get-Item "dist\TKO\TKO.exe"
+
+          $hash = Get-FileHash `
+            "dist\TKO\TKO.exe" `
+            -Algorithm SHA256
+
+          @"
+          TKO Windows Portable Build Manifest
+          ===================================
+          Repository : $env:GITHUB_REPOSITORY
+          Commit     : $env:GITHUB_SHA
+          Ref        : $env:GITHUB_REF
+          Run ID     : $env:GITHUB_RUN_ID
+
+          Runner OS  : $env:RUNNER_OS
+          Python     :
+          $(python --version)
+
+          PyInstaller:
+          $(python -m PyInstaller --version)
+
+          Executable :
+          $($exe.FullName)
+
+          Size       :
+          $($exe.Length) bytes
+
+          SHA256     :
+          $($hash.Hash)
+          "@ | Set-Content "TKO-Windows-Portable-manifest.txt"
+
+          Get-Content "TKO-Windows-Portable-manifest.txt"
+
+          Write-Host "MANIFEST_OK"
+
+      # ============================================================
+      # 10. PACKAGE ZIP
+      # ============================================================
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (Test-Path "TKO-Windows-Portable.zip") {
+            Remove-Item "TKO-Windows-Portable.zip" -Force
+          }
+
+          Compress-Archive `
+            -Path "dist\TKO\*" `
+            -DestinationPath "TKO-Windows-Portable.zip" `
+            -Force
+
+          if (-not (Test-Path "TKO-Windows-Portable.zip")) {
+            throw "Portable ZIP was not created"
+          }
+
+          $zip = Get-Item "TKO-Windows-Portable.zip"
+
+          Write-Host "PACKAGE_OK"
+          Write-Host "Name     : $($zip.Name)"
+          Write-Host "Length   : $($zip.Length)"
+          Write-Host "FullName : $($zip.FullName)"
+
+      # ============================================================
+      # 11. FINAL ARTIFACT HASH
+      # ============================================================
+      - name: Generate final artifact hash
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $hash = Get-FileHash `
+            "TKO-Windows-Portable.zip" `
+            -Algorithm SHA256
+
+          @"
+          TKO-Windows-Portable.zip
+          SHA256: $($hash.Hash)
+          "@ | Set-Content "TKO-Windows-Portable-SHA256.txt"
+
+          Get-Content "TKO-Windows-Portable-SHA256.txt"
+
+          Write-Host "FINAL_ARTIFACT_HASH_OK"
+
+      # ============================================================
+      # 12. UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload artifact
+        # actions/upload-artifact@v4.0.0 (Commit SHA Resmi Valid)
+        uses: actions/upload-artifact@505e3d7573d676117d89956979ca5dbd37706d11
+        with:
+          name: TKO-Windows-Portable
+          path: |
+            TKO-Windows-Portable.zip
+            TKO-Windows-Portable-manifest.txt
+            TKO-Windows-Portable-SHA256.txt
+          if-no-files-found: error
+          retention-days: 14
