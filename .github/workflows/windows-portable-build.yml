@@ -1,0 +1,73 @@
+name: Windows Portable Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tko.spec'
+      - 'tko_worker_entry.py'
+      - 'scripts/build_windows.bat'
+      - '.github/workflows/windows-portable-build.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests pandas numpy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Full pytest
+        run: python -m pytest -q
+      - name: Safety scans
+        run: |
+          ! grep -n force_live_gate tokocrypto_bot/application.py
+          echo SCAN_OK
+
+  windows-build:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller pytest requests pandas numpy
+          if (Test-Path requirements.txt) { python -m pip install -r requirements.txt }
+      - name: Build portable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm tko.spec
+          if (-not (Test-Path "dist\TKO\TKO.exe")) { throw "TKO.exe missing" }
+      - name: Smoke PAPER
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\TKO\TKO.exe" -ArgumentList "--mode","PAPER","--poll-interval","2" -PassThru -NoNewWindow -RedirectStandardOutput "smoke_paper.txt" -RedirectStandardError "smoke_paper_err.txt"
+          Start-Sleep -Seconds 15
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Get-Content smoke_paper.txt,smoke_paper_err.txt -ErrorAction SilentlyContinue
+      - name: Smoke LIVE blocked
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\TKO\TKO.exe" -ArgumentList "--mode","LIVE" -PassThru -NoNewWindow -RedirectStandardOutput "smoke_live.txt" -RedirectStandardError "smoke_live_err.txt" -Wait
+          Get-Content smoke_live.txt,smoke_live_err.txt -ErrorAction SilentlyContinue
+          $txt = (Get-Content smoke_live.txt,smoke_live_err.txt -Raw -ErrorAction SilentlyContinue)
+          if ($txt -notmatch "LIVE blocked|missing API credentials|HardLiveGate") { throw "Expected LIVE fail-closed message" }
+      - name: Zip portable
+        shell: pwsh
+        run: Compress-Archive -Path "dist\TKO\*" -DestinationPath "TKO-Windows-Portable.zip" -Force
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TKO-Windows-Portable
+          path: TKO-Windows-Portable.zip
