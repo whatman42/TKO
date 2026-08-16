@@ -177,7 +177,7 @@ class HardenedReconciliationEngine:
             ppm = PositionProtectionManager(self.state_mgr, self.exchange, getattr(self.state_mgr, "exchange_id", "TOKOCRYPTO"))
             if not ppm.max_algo_allows_new():
                 logger.critical("max-algo gate: cannot attach protection")
-            return
+                return
             symbol = local_order["symbol"]
             cid = local_order["client_order_id"]
             # use cumulative executed for this order as protected qty basis
