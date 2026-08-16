@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger("NVRA.CircuitBreaker")
@@ -16,6 +16,11 @@ logger = logging.getLogger("NVRA.CircuitBreaker")
 
 @dataclass
 class CircuitBreaker:
+    """
+    Trip after `failure_threshold` consecutive failures.
+    While OPEN: operations should fail closed (SAFE_MODE / NO_TRADE).
+    Half-open after `recovery_timeout_sec`.
+    """
     failure_threshold: int = 5
     recovery_timeout_sec: float = 60.0
     consecutive_failures: int = 0
@@ -42,6 +47,7 @@ class CircuitBreaker:
             return False
         elapsed = time.time() - self.opened_at
         if elapsed >= self.recovery_timeout_sec:
+            # half-open: allow one probe
             logger.warning("CircuitBreaker HALF-OPEN — allowing probe request")
             return False
         return True
