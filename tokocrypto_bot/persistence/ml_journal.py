@@ -205,3 +205,45 @@ class MLJournal:
                 conn.close()
         except Exception:
             return 0
+
+    def fetch_training_rows(self, min_rows: int = 1) -> list:
+        """Return list of {features: dict, label: int} for continual learning."""
+        try:
+            conn = self.db.get_connection()
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT p.features_json, p.decision_action, p.prediction_valid,
+                           o.realized_pnl_usdt, o.side
+                    FROM ml_prediction_log p
+                    LEFT JOIN ml_trade_outcomes o ON o.prediction_id = p.prediction_id
+                    WHERE p.prediction_valid = 1
+                    ORDER BY p.feature_timestamp ASC
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+            out = []
+            for features_json, decision_action, _valid, pnl, side in rows:
+                try:
+                    feats = json.loads(features_json) if features_json else {}
+                except Exception:
+                    continue
+                if not feats:
+                    continue
+                label = None
+                if pnl is not None:
+                    label = 1 if float(pnl) > 0 else 0
+                else:
+                    act = str(decision_action or "").upper()
+                    if act == "BUY":
+                        label = 1
+                    elif act == "SELL":
+                        label = 0
+                if label is None:
+                    continue
+                out.append({"features": feats, "label": int(label)})
+            return out
+        except Exception as e:
+            logger.error("fetch_training_rows failed: %s", e)
+            return []
