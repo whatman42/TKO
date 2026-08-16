@@ -1,0 +1,32 @@
+# .github/workflows/sync-to-tko.yml
+name: Sync to TKO
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:   # manual trigger dari tab Actions
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push mirror to whatman42/TKO
+        env:
+          TKO_TOKEN: ${{ secrets.TKO_PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote remove tko 2>/dev/null || true
+          git remote add tko "https://x-access-token:${TKO_TOKEN}@github.com/whatman42/TKO.git"
+
+          # Mirror branch main → main (overwrite target to match source exactly)
+          git push tko HEAD:main --force
+
+          echo "Mirrored $(git rev-parse HEAD) → whatman42/TKO main"
