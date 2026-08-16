@@ -1,0 +1,16 @@
+# TKO — runtime + test dependencies
+# Python 3.11 / 3.12
+
+# Core runtime
+requests>=2.31.0,<3
+numpy>=1.26.0,<3
+pandas>=2.1.0,<3
+
+# Tests (CI / local)
+pytest>=8.0.0,<9
+
+# Windows portable build (CI / local packaging)
+pyinstaller>=6.3.0,<7
+
+# Windows-only: DPAPI credentials + optional service helpers
+pywin32>=306; sys_platform == "win32"
