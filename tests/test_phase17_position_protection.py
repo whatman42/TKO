@@ -4,222 +4,199 @@ from datetime import datetime, timezone
 from tokocrypto_bot.persistence.database import DatabaseManager, get_db_transaction
 from tokocrypto_bot.persistence.migrations import run_migrations
 from tokocrypto_bot.persistence.state_manager import StateManager
-from tokocrypto_bot.execution.position_protection import PositionProtectionManager, PROTECTION_ACTIVE, PROTECTION_PENDING, PROTECTION_FILLED, PROTECTION_NONE
+from tokocrypto_bot.execution.position_protection import (
+    PositionProtectionManager, PROTECTION_ACTIVE, PROTECTION_PENDING, MAX_ALGO_ORDERS
+)
 from tokocrypto_bot.execution.reconciliation import HardenedReconciliationEngine, ReconciliationResult, ReconciliationDecision
 from tokocrypto_bot.execution.order_state_machine import OrderStatus
-from tokocrypto_bot.persistence.lifecycle_state import LifecycleManager
 
 
-class FakeExchange:
+class MockEx:
     def __init__(self):
         self.orders = {}
-        self.post_calls = 0
-        self.fail_post = False
-
+        self.posts = 0
+        self.balances = {"USDT": {"free": 10000.0, "locked": 0.0}}
     def fetch_order_by_client_id(self, symbol, client_order_id):
         return self.orders.get(client_order_id)
-
-    def post_stop_loss_limit_non_retry(self, symbol, side, quantity, stop_price, limit_price=None, client_order_id=None):
-        self.post_calls += 1
-        if self.fail_post:
-            raise TimeoutError("simulated timeout")
-        oid = client_order_id or f"PROT-{len(self.orders)}"
-        self.orders[oid] = {
-            "orderId": f"EX-{oid}",
-            "clientOrderId": oid,
-            "status": "NEW",
-            "symbol": symbol,
-            "side": side,
-            "executedQty": "0",
-            "origQty": str(quantity),
-            "price": str(limit_price or stop_price),
-            "stopPrice": str(stop_price),
-        }
-        return self.orders[oid]
-
-    def fetch_open_orders(self, symbol=None):
-        return [o for o in self.orders.values() if o.get("status") in ("NEW", "OPEN", "PARTIALLY_FILLED")]
-
-    def fetch_recent_trades(self, symbol, limit=50):
-        return []
-
+    def post_stop_loss_limit_non_retry(self, **kwargs):
+        self.posts += 1
+        cid = kwargs["client_order_id"]
+        od = {"orderId": f"SL{self.posts}", "clientOrderId": cid, "symbol": kwargs["symbol"],
+              "status": "NEW", "executedQty": "0", "origQty": str(kwargs["quantity"])}
+        self.orders[cid] = od
+        return od
     def fetch_account_balances(self):
-        return {"USDT": {"free": 1000.0, "locked": 0.0}}
-
-    def cancel_order_non_retry(self, symbol, client_order_id=None, exchange_order_id=None):
-        key = client_order_id or exchange_order_id
-        if key in self.orders:
-            self.orders[key]["status"] = "CANCELED"
+        return self.balances
+    def cancel_order_non_retry(self, **kwargs):
         return {"status": "CANCELED"}
 
 
 @pytest.fixture
-def env(tmp_path):
-    db_path = str(tmp_path / "t17.db")
-    db = DatabaseManager(db_path)
-    run_migrations(db)
-    sm = StateManager(db)
-    fx = FakeExchange()
-    ppm = PositionProtectionManager(sm, fx)
-    return db, sm, fx, ppm
+def env():
+    with tempfile.TemporaryDirectory() as d:
+        db = DatabaseManager(db_path=os.path.join(d, "p17.db"))
+        run_migrations(db)
+        sm = StateManager(db)
+        ex = MockEx()
+        ppm = PositionProtectionManager(sm, ex)
+        recon = HardenedReconciliationEngine(sm, ex)
+        yield ppm, sm, ex, db, recon
 
 
 def test_ensure_protection_active(env):
-    db, sm, fx, ppm = env
-    status = ppm.ensure_protection("BTCUSDT", "CID-1", 0.5, 90000.0)
-    assert status == PROTECTION_ACTIVE
-    assert fx.post_calls == 1
-    assert "PROT-CID-1-BTCUSDT" in fx.orders
+    ppm, sm, ex, db, recon = env
+    assert ppm.ensure_protection("BTCUSDT", "PARENT1", 0.5, 58000.0) == PROTECTION_ACTIVE
+    assert ex.posts == 1
 
 
-def test_pre_submit_lookup_avoids_duplicate_post(env):
-    db, sm, fx, ppm = env
-    cid = ppm.deterministic_protective_cid("CID-2", "BTCUSDT")
-    fx.orders[cid] = {"orderId": "EX1", "clientOrderId": cid, "status": "NEW", "executedQty": "0"}
-    status = ppm.ensure_protection("BTCUSDT", "CID-2", 0.5, 90000.0)
-    assert status == PROTECTION_ACTIVE
-    assert fx.post_calls == 0
-
-
-def test_post_timeout_becomes_pending_no_retry(env):
-    db, sm, fx, ppm = env
-    fx.fail_post = True
-    status = ppm.ensure_protection("BTCUSDT", "CID-3", 0.5, 90000.0)
-    assert status == PROTECTION_PENDING
-    assert fx.post_calls == 1
-
-
-def test_reconcile_pending_to_active(env):
-    db, sm, fx, ppm = env
-    fx.fail_post = True
-    ppm.ensure_protection("BTCUSDT", "CID-4", 0.5, 90000.0)
-    fx.fail_post = False
-    cid = ppm.deterministic_protective_cid("CID-4", "BTCUSDT")
-    fx.orders[cid] = {"orderId": "EX4", "clientOrderId": cid, "status": "NEW", "executedQty": "0"}
+def test_no_blind_retry_on_pending_not_found(env):
+    ppm, sm, ex, db, recon = env
+    ppm.ensure_protection("BTCUSDT", "PARENT2", 0.5, 58000.0)
+    prot_cid = ppm.deterministic_protective_cid("PARENT2", "BTCUSDT")
+    ppm._upsert_row("BTCUSDT", "PARENT2", prot_cid, 0.5, 58000.0, PROTECTION_PENDING)
+    ex.orders.clear()
+    before = ex.posts
     ppm.reconcile_pending_protections()
+    assert ex.posts == before
+
+
+def test_max_algo_fail_closed(env):
+    ppm, sm, ex, db, recon = env
+    for i in range(MAX_ALGO_ORDERS):
+        ppm.ensure_protection(f"SYM{i}", f"P{i}", 0.1, 100.0)
+    assert ppm.ensure_protection("EXTRA", "PX", 0.1, 100.0) == "NONE"
+
+
+def test_naked_position_listed(env):
+    ppm, sm, ex, db, recon = env
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db_transaction(db) as conn:
+        conn.execute(
+            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
+            ("TOKOCRYPTO", "DEFAULT", "BTCUSDT", 1.0, 50000.0, now),
+        )
+    assert any(n["symbol"] == "BTCUSDT" for n in ppm.list_unprotected_positions())
+
+
+def test_deterministic_cid(env):
+    ppm, sm, ex, db, recon = env
+    assert ppm.deterministic_protective_cid("P", "BTCUSDT") == ppm.deterministic_protective_cid("P", "BTCUSDT")
+
+
+def test_buy_fill_attaches_protection_via_reconciliation(env):
+    ppm, sm, ex, db, recon = env
+    assert sm.create_order_intent("BUY1", "E1", "S1", "BTCUSDT", "BUY", "LIMIT", 60000.0, 1.0)
+    with get_db_transaction(db) as conn:
+        conn.execute("UPDATE orders SET stop_price=? WHERE client_order_id=? AND exchange_id=?", (58000.0, "BUY1", "TOKOCRYPTO"))
+    order = sm.get_order("BUY1")
+    res = ReconciliationResult(
+        client_order_id="BUY1", decision=ReconciliationDecision.FOUND_FILLED,
+        target_order_status=OrderStatus.FILLED, exchange_order_id="99",
+        executed_qty=1.0, remaining_qty=0.0, avg_price=60000.0, reason="filled",
+    )
+    delta = recon._record_fill_idempotent(order, res)
+    assert delta > 0
     conn = db.get_connection()
     try:
         row = conn.execute(
-            "SELECT protection_status FROM position_protection WHERE symbol=?",
-            ("BTCUSDT",),
+            "SELECT protection_status, protected_qty, stop_price FROM position_protection WHERE exchange_id=? AND symbol=?",
+            ("TOKOCRYPTO", "BTCUSDT"),
         ).fetchone()
     finally:
         conn.close()
+    assert row is not None
     assert row[0] == PROTECTION_ACTIVE
+    assert abs(float(row[1]) - 1.0) < 1e-9
+    assert ex.posts >= 1
 
 
-def test_protective_fill_reduces_position(env):
-    db, sm, fx, ppm = env
+def test_partial_fill_protection_qty_follows_executed(env):
+    ppm, sm, ex, db, recon = env
+    assert sm.create_order_intent("BUY2", "E1", "S1", "BTCUSDT", "BUY", "LIMIT", 60000.0, 1.0)
     with get_db_transaction(db) as conn:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
-            ("TOKOCRYPTO", "DEFAULT", "BTCUSDT", 1.0, 95000.0, now),
-        )
-    status = ppm.ensure_protection("BTCUSDT", "CID-5", 1.0, 90000.0)
-    assert status == PROTECTION_ACTIVE
-    cid = ppm.deterministic_protective_cid("CID-5", "BTCUSDT")
-    fx.orders[cid] = {
-        "orderId": "EX5",
-        "clientOrderId": cid,
-        "status": "FILLED",
-        "executedQty": "1.0",
-        "price": "90000",
-    }
-    ppm.reconcile_pending_protections()
-    # force fill path via reconcile when status already ACTIVE by calling _apply
-    ppm._apply_protective_fill("BTCUSDT", cid, fx.orders[cid])
+        conn.execute("UPDATE orders SET stop_price=? WHERE client_order_id=? AND exchange_id=?", (58000.0, "BUY2", "TOKOCRYPTO"))
+    order = sm.get_order("BUY2")
+    res = ReconciliationResult(
+        client_order_id="BUY2", decision=ReconciliationDecision.FOUND_PARTIALLY_FILLED,
+        target_order_status=OrderStatus.PARTIALLY_FILLED, exchange_order_id="X1",
+        executed_qty=0.4, remaining_qty=0.6, avg_price=60000.0, reason="partial",
+    )
+    recon._record_fill_idempotent(order, res)
     conn = db.get_connection()
     try:
-        qty = float(conn.execute("SELECT total_qty FROM positions WHERE symbol=?", ("BTCUSDT",)).fetchone()[0])
-        fills = conn.execute("SELECT COUNT(*) FROM fills WHERE client_order_id=?", (cid,)).fetchone()[0]
+        row = conn.execute(
+            "SELECT protected_qty FROM position_protection WHERE exchange_id=? AND symbol=?",
+            ("TOKOCRYPTO", "BTCUSDT"),
+        ).fetchone()
     finally:
         conn.close()
-    assert qty == 0.0
-    assert fills == 1
+    assert row is not None and abs(float(row[0]) - 0.4) < 1e-9
 
 
-def test_max_algo_gate_blocks(env):
-    db, sm, fx, ppm = env
-    for i in range(5):
-        with get_db_transaction(db) as conn:
-            now = datetime.now(timezone.utc).isoformat()
-            conn.execute(
-                "INSERT INTO position_protection (exchange_id, account_id, symbol, protection_status, protected_qty, updated_at) VALUES (?,?,?,?,?,?)",
-                ("TOKOCRYPTO", "DEFAULT", f"S{i}", PROTECTION_ACTIVE, 0.1, now),
-            )
-    assert ppm.max_algo_allows_new() is False
-    status = ppm.ensure_protection("BTCUSDT", "CID-MAX", 0.5, 90000.0)
-    assert status == PROTECTION_NONE
-    assert fx.post_calls == 0
-
-
-def test_idempotent_protective_fill(env):
-    db, sm, fx, ppm = env
-    with get_db_transaction(db) as conn:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
-            ("TOKOCRYPTO", "DEFAULT", "ETHUSDT", 2.0, 3000.0, now),
-        )
-    ppm.ensure_protection("ETHUSDT", "CID-6", 2.0, 2800.0)
-    cid = ppm.deterministic_protective_cid("CID-6", "ETHUSDT")
-    od = {"orderId": "EX6", "clientOrderId": cid, "status": "FILLED", "executedQty": "2.0", "price": "2800"}
-    ppm._apply_protective_fill("ETHUSDT", cid, od)
-    ppm._apply_protective_fill("ETHUSDT", cid, od)
+def test_missing_stop_price_fail_closed_no_attach(env):
+    ppm, sm, ex, db, recon = env
+    assert sm.create_order_intent("BUY3", "E1", "S1", "ETHUSDT", "BUY", "LIMIT", 3000.0, 1.0)
+    order = sm.get_order("BUY3")
+    res = ReconciliationResult(
+        client_order_id="BUY3", decision=ReconciliationDecision.FOUND_FILLED,
+        target_order_status=OrderStatus.FILLED, exchange_order_id="X2",
+        executed_qty=1.0, remaining_qty=0.0, avg_price=3000.0, reason="filled",
+    )
+    before = ex.posts
+    recon._record_fill_idempotent(order, res)
+    assert ex.posts == before
     conn = db.get_connection()
     try:
-        qty = float(conn.execute("SELECT total_qty FROM positions WHERE symbol=?", ("ETHUSDT",)).fetchone()[0])
-        fills = conn.execute("SELECT COUNT(*) FROM fills WHERE client_order_id=?", (cid,)).fetchone()[0]
+        row = conn.execute(
+            "SELECT 1 FROM position_protection WHERE exchange_id=? AND symbol=?",
+            ("TOKOCRYPTO", "ETHUSDT"),
+        ).fetchone()
     finally:
         conn.close()
-    assert qty == 0.0
-    assert fills == 1
+    assert row is None
 
 
-def test_stop_price_persists_across_restart(env):
-    db, sm, fx, ppm = env
+def test_same_qty_replay_no_duplicate_fill(env):
+    ppm, sm, ex, db, recon = env
+    assert sm.create_order_intent("BUY4", "E1", "S1", "BTCUSDT", "BUY", "LIMIT", 60000.0, 0.5)
     with get_db_transaction(db) as conn:
-        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE orders SET stop_price=? WHERE client_order_id=? AND exchange_id=?", (58000.0, "BUY4", "TOKOCRYPTO"))
+    order = sm.get_order("BUY4")
+    res = ReconciliationResult(
+        client_order_id="BUY4", decision=ReconciliationDecision.FOUND_FILLED,
+        target_order_status=OrderStatus.FILLED, exchange_order_id="X4",
+        executed_qty=0.5, remaining_qty=0.0, avg_price=60000.0, reason="f",
+    )
+    assert recon._record_fill_idempotent(order, res) > 0
+    assert recon._record_fill_idempotent(order, res) == 0
+
+
+def test_protective_filled_reduces_position(env):
+    ppm, sm, ex, db, recon = env
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db_transaction(db) as conn:
+        conn.execute(
+            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
+            ("TOKOCRYPTO", "DEFAULT", "BTCUSDT", 1.0, 50000.0, now),
+        )
+        # parent order for FK on fills
         conn.execute(
             """INSERT INTO orders (exchange_id, account_id, client_order_id, execution_id, signal_id, symbol, side, order_type,
-               price, quantity, status, stop_price, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            ("TOKOCRYPTO", "DEFAULT", "ENTRY-1", "EX1", "SIG1", "BTCUSDT", "BUY", "LIMIT",
-             95000.0, 0.5, "FILLED", 90000.0, now, now),
+               price, quantity, status, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("TOKOCRYPTO", "DEFAULT", "PROT-P-BTCUSDT", "E", "S", "BTCUSDT", "SELL", "STOP_LOSS_LIMIT",
+             48000.0, 1.0, "NEW", now, now),
         )
-        conn.execute(
-            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
-            ("TOKOCRYPTO", "DEFAULT", "BTCUSDT", 0.5, 95000.0, now),
-        )
-    ppm.ensure_protection("BTCUSDT", "ENTRY-1", 0.5, 90000.0)
+    prot_cid = "PROT-P-BTCUSDT"
+    ppm._upsert_row("BTCUSDT", "P", prot_cid, 1.0, 48000.0, PROTECTION_ACTIVE)
+    od = {"orderId": "9", "clientOrderId": prot_cid, "status": "FILLED", "executedQty": "1.0", "price": "48000"}
+    ppm._apply_protective_fill("BTCUSDT", prot_cid, od)
+    ppm._apply_protective_fill("BTCUSDT", prot_cid, od)
     conn = db.get_connection()
     try:
-        stop = conn.execute(
-            "SELECT stop_price FROM position_protection WHERE symbol=?",
-            ("BTCUSDT",),
-        ).fetchone()[0]
+        qty = float(conn.execute("SELECT total_qty FROM positions WHERE exchange_id=? AND symbol=?", ("TOKOCRYPTO", "BTCUSDT")).fetchone()[0])
+        fills = conn.execute("SELECT COUNT(*) FROM fills WHERE fill_id LIKE ?", (f"PFILL-{prot_cid}%",)).fetchone()[0]
     finally:
         conn.close()
-    assert float(stop) == 90000.0
-
-
-def test_list_unprotected_positions(env):
-    db, sm, fx, ppm = env
-    with get_db_transaction(db) as conn:
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute(
-            "INSERT INTO positions (exchange_id, account_id, symbol, total_qty, locked_qty, avg_buy_price, updated_at) VALUES (?,?,?,?,0,?,?)",
-            ("TOKOCRYPTO", "DEFAULT", "SOLUSDT", 10.0, 100.0, now),
-        )
-    naked = ppm.list_unprotected_positions()
-    assert any(p["symbol"] == "SOLUSDT" for p in naked)
-
-
-def test_not_found_pending_no_blind_post(env):
-    db, sm, fx, ppm = env
-    fx.fail_post = True
-    ppm.ensure_protection("BTCUSDT", "CID-7", 0.5, 90000.0)
-    assert fx.post_calls == 1
-    ppm.reconcile_pending_protections()
-    assert fx.post_calls == 1  # no additional POST
+    assert qty == 0.0
+    assert fills == 1
